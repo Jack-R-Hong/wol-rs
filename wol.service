@@ -1,0 +1,12 @@
+[Unit]
+Description=Wake-on-LAN server (wolrs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wolrs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

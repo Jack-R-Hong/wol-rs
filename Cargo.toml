@@ -1,0 +1,13 @@
+[package]
+name = "wolrs"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency Wake-on-LAN CLI + HTTP server (for RPi3 + Cloudflare Tunnel)"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
