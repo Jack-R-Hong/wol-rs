@@ -72,9 +72,9 @@ struct Iface {
     wired: bool,
 }
 
-const SIOCGIFADDR: libc::c_ulong = 0x8915;
-const SIOCGIFBRDADDR: libc::c_ulong = 0x8919;
-const SIOCGIFNETMASK: libc::c_ulong = 0x891B;
+const SIOCGIFADDR: u32 = 0x8915;
+const SIOCGIFBRDADDR: u32 = 0x8919;
+const SIOCGIFNETMASK: u32 = 0x891B;
 
 fn iface_is_up(name: &str) -> bool {
     std::fs::read(format!("/sys/class/net/{}/operstate", name))
@@ -92,7 +92,7 @@ struct Ifr {
     sa: libc::sockaddr_in,
 }
 
-fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: libc::c_ulong, ifname: S) -> Option<libc::sockaddr_in> {
+fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: u32, ifname: S) -> Option<libc::sockaddr_in> {
     let n = S::as_ref(&ifname);
     if n.is_empty() {
         return None;
@@ -105,7 +105,7 @@ fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: libc::c_ulon
         ifr.name[..len].copy_from_slice(&bytes[..len].iter().map(|b| *b as libc::c_char).collect::<Vec<_>>()[..]);
         ifr.name[len] = 0;
         ifr.sa.sin_family = libc::AF_INET as u16;
-        let ret = libc::ioctl(fd, cmd, &ifr);
+        let ret = libc::ioctl(fd, cmd as _, &ifr);
         if ret < 0 {
             None
         } else {
@@ -155,21 +155,25 @@ fn in_net(ifc: &Iface, ip: [u8; 4]) -> bool {
     (0..4).all(|i| (ifc.addr[i] ^ ip[i]) & ifc.netmask[i] == 0)
 }
 
-/// 依需求排序:1) 指定 iface  2) 目標 IP 所在子網  3) 有線上網卡  4) 其餘
+/// 依需求排序:1) 指定 iface  2) 有線上網卡(預設只用有線)  有線卡內再優先目標 IP 所在子網
 fn pick_ifaces(target_ip: Option<[u8; 4]>, force: Option<&str>) -> Vec<Iface> {
     let mut ifs = scan_ifaces();
     if let Some(f) = force.map(|s| s.to_string()) {
         ifs.sort_by_key(|i| if i.name == f { 0 } else { 1 });
+        ifs
     } else {
-        ifs.sort_by(|a, b| {
-            let ka = if target_ip.map_or(false, |ip| in_net(a, ip)) { 0 }
-                      else if a.wired { 1 } else { 2 };
-            let kb = if target_ip.map_or(false, |ip| in_net(b, ip)) { 0 }
-                      else if b.wired { 1 } else { 2 };
+        // 預設:有線卡優先;有線卡內目標子網匹配的放最前;沒有有線卡才用其餘介面保底
+        let mut chosen: Vec<_> = ifs.into_iter().filter(|i| i.wired).collect();
+        if chosen.is_empty() {
+            chosen = scan_ifaces();
+        }
+        chosen.sort_by(|a, b| {
+            let ka = if target_ip.map_or(false, |ip| in_net(a, ip)) { 0 } else { 1 };
+            let kb = if target_ip.map_or(false, |ip| in_net(b, ip)) { 0 } else { 1 };
             ka.cmp(&kb).then(b.name.len().cmp(&a.name.len()))
         });
+        chosen
     }
-    ifs
 }
 
 fn broadcast_of(ifc: &Iface) -> [u8; 4] {
