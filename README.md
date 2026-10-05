@@ -16,6 +16,11 @@ RPi3 常開 → Cloudflare Tunnel 把它的 HTTP 服務暴露到 `https://wol.ex
 之後仍會順帶發給其他介面與 255.255.255.255 作保底。
 若機器有填 IP,則該 IP 所在子網的介面自動置頂。
 
+**狀態偵測(status)雙網卡處理**:`/api/status` 的 ping 會依「指定網卡 > 目標 IP 子網匹配 > 有線卡 > 其他」
+**逐卡綁定來源 IP 嘗試**,任一張成功即回報 online,並在 `via` 欄位顯示實際到達的網卡。
+因此目標機器在無線卡子網、或有線卡排序不如預期時,不會再誤報離線。
+CLI 同:`wolrs <ip>` 未指定網卡時也會逐卡嘗試。
+
 ## 使用
 
 ### CLI(LAN 內直接喚醒)
@@ -45,6 +50,10 @@ cargo build --release
 # cargo build --release --target armv7-unknown-linux-gnueabihf
 sudo install -m755 target/release/wolrs /usr/local/bin/wolrs
 sudo systemctl enable --now wol   # 用本 repo 的 wol.service
+
+# 若非以 root 執行(例如直接跑二進位),status 的 ICMP ping 需要權限:
+sudo setcap cap_net_raw+ep /usr/local/bin/wolrs
+# 或把執行者的 gid 寫進 /proc/sys/net/ipv4/ping_group_range
 ```
 
 ## Cloudflare Tunnel

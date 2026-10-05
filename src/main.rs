@@ -20,6 +20,9 @@ struct Machine {
     name: String,
     mac: String,
     ip: Option<String>,
+    /// 固定發射/探測用網卡(雙網卡環境避免走錯卡)
+    #[serde(default)]
+    iface: Option<String>,
 }
 
 static STATE: OnceLock<Mutex<Vec<Machine>>> = OnceLock::new();
@@ -155,25 +158,23 @@ fn in_net(ifc: &Iface, ip: [u8; 4]) -> bool {
     (0..4).all(|i| (ifc.addr[i] ^ ip[i]) & ifc.netmask[i] == 0)
 }
 
-/// 依需求排序:1) 指定 iface  2) 有線上網卡(預設只用有線)  有線卡內再優先目標 IP 所在子網
+/// 依需求排序:1) 指定 iface 置頂  2) 目標 IP 所在子網匹配的介面  3) 有線卡  4) 其餘介面
+/// 回傳所有 up 的 IPv4 介面(雙網卡環境讓呼叫端可逐卡 fallback)
 fn pick_ifaces(target_ip: Option<[u8; 4]>, force: Option<&str>) -> Vec<Iface> {
     let mut ifs = scan_ifaces();
-    if let Some(f) = force.map(|s| s.to_string()) {
+    if let Some(f) = force {
         ifs.sort_by_key(|i| if i.name == f { 0 } else { 1 });
-        ifs
-    } else {
-        // 預設:有線卡優先;有線卡內目標子網匹配的放最前;沒有有線卡才用其餘介面保底
-        let mut chosen: Vec<_> = ifs.into_iter().filter(|i| i.wired).collect();
-        if chosen.is_empty() {
-            chosen = scan_ifaces();
-        }
-        chosen.sort_by(|a, b| {
-            let ka = if target_ip.map_or(false, |ip| in_net(a, ip)) { 0 } else { 1 };
-            let kb = if target_ip.map_or(false, |ip| in_net(b, ip)) { 0 } else { 1 };
-            ka.cmp(&kb).then(b.name.len().cmp(&a.name.len()))
-        });
-        chosen
+        return ifs;
     }
+    ifs.sort_by(|a, b| {
+        let ka = if target_ip.map_or(false, |ip| in_net(a, ip)) { 0 } else { 1 };
+        let kb = if target_ip.map_or(false, |ip| in_net(b, ip)) { 0 } else { 1 };
+        ka.cmp(&kb)
+            // 同子網匹配狀態時,有線卡在前(wired=true 於 false)
+            .then(b.wired.cmp(&a.wired))
+            .then(a.name.len().cmp(&b.name.len()))
+    });
+    ifs
 }
 
 fn broadcast_of(ifc: &Iface) -> [u8; 4] {
@@ -189,28 +190,69 @@ fn broadcast_of(ifc: &Iface) -> [u8; 4] {
 
 // ---------- WoL ----------
 
-/// 預設透過「有線網卡」的子網 broadcast 送出;無有線卡或目标不在此子網時,
-/// 也會順帶發給其他介面與 255.255.255.255 作保底。
-fn send_wol(mac: [u8; 6]) -> std::io::Result<Vec<SocketAddr>> { send_wol_opt(mac, None, None) }
+/// 指定 iface(query/CLI/機器設定/WOLRS_IFACE):只透過該網卡 broadcast,不存在/未 up 時直接報錯,
+/// 避免雙網卡環境 magic packet 走錯卡;未指定則依「目標子網匹配 > 有線卡 > 其他」
+/// 對所有 up 的介面發送,再以 255.255.255.255 保底(kernel 選路)。
+fn send_wol(mac: [u8; 6]) -> std::io::Result<Vec<SocketAddr>> { send_wol_opt(mac, None, None, None) }
 
-fn send_wol_opt(mac: [u8; 6], target_ip: Option<[u8; 4]>, force_iface: Option<&str>) -> std::io::Result<Vec<SocketAddr>> {
+/// 依名稱找網卡(僅 up 的介面)
+fn iface_by_name(name: &str) -> Option<Iface> {
+    scan_ifaces().into_iter().find(|i| i.name == name)
+}
+
+/// 依候選網卡順序逐一 ping(雙網卡環境:第一張卡失敗時自動換下一張),
+/// 任一成功即回傳 (true, 經由網卡);全失敗再試不 bind 的 default route。
+/// 回傳 (是否 online, 經由網卡或 None)。
+fn ping_via_any(target_ip: [u8; 4], force: Option<&str>) -> (bool, Option<String>) {
+    let p = std::net::Ipv4Addr::from(target_ip);
+    let cands = pick_ifaces(Some(target_ip), force);
+    for (i, c) in cands.iter().enumerate() {
+        // 最優先的候選給完整超時,其餘 fallback 縮短,避免總等待過長
+        let timeout = if i == 0 { 1000 } else { 500 };
+        if icmp_ping(&p.to_string(), timeout, Some(std::net::Ipv4Addr::from(c.addr))).unwrap_or(false) {
+            return (true, Some(c.name.clone()));
+        }
+    }
+    if cands.is_empty() {
+        // 沒有任何 up 的 IPv4 介面:純 kernel 選路
+        let ok = icmp_ping(&p.to_string(), 1000, None).unwrap_or(false);
+        return (ok, if ok { Some("default-route".into()) } else { None });
+    }
+    if icmp_ping(&p.to_string(), 500, None).unwrap_or(false) {
+        return (true, Some("default-route".into()));
+    }
+    (false, None)
+}
+
+fn send_wol_opt(mac: [u8; 6], target_ip: Option<[u8; 4]>, force_iface: Option<&str>, prefer_iface: Option<&str>) -> std::io::Result<Vec<SocketAddr>> {
     let packet = [vec![0xFFu8; 6], mac.to_vec().repeat(16)].concat();
-    // env 覆蓋:WOLRS_IFACE=eth0
+    // 優先序:query/CLI 明確指定 > 機器設定 > env WOLRS_IFACE
     let force = force_iface
         .map(|s| s.to_string())
+        .or_else(|| prefer_iface.map(|s| s.to_string()))
         .or_else(|| env::var("WOLRS_IFACE").ok())
         .filter(|s| !s.is_empty());
+    let ifcs: Vec<Iface> = match force.as_deref() {
+        Some(f) => match iface_by_name(f) {
+            Some(i) => vec![i],
+            None => return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("iface {} not found or not up", f),
+            )),
+        },
+        None => pick_ifaces(target_ip, None),
+    };
     let mut sent = Vec::new();
-    for ifc in pick_ifaces(target_ip, force.as_deref()) {
+    for ifc in &ifcs {
         let bind = std::net::Ipv4Addr::from(ifc.addr);
-        let to = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(broadcast_of(&ifc))), 9u16);
+        let to = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(broadcast_of(ifc))), 9u16);
         let sock = std::net::UdpSocket::bind((bind, 0))?;
         sock.set_broadcast(true)?;
         sock.send_to(&packet, to)?;
         sent.push(to);
     }
-    // 保底:global broadcast(由 kernel 選路,雙網卡環境可能走錯卡,故放最後)
-    if !sent.is_empty() {
+    // 保底:global broadcast(由 kernel 選路,雙網卡環境可能走錯卡,故放最後,且仅在未明確指定網卡時才發)
+    if force.is_none() && !sent.is_empty() {
         let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         sock.set_broadcast(true)?;
         let to = SocketAddr::from(([255, 255, 255, 255], 9u16));
@@ -241,7 +283,9 @@ fn norm_mac(s: &str) -> Option<String> {
 
 // ---------- Ping (ICMP, unprivileged via SOCK_DGRAM, fallback SOCK_RAW) ----------
 
-fn icmp_ping(host: &str, timeout_ms: u64) -> Result<bool, String> {
+/// ICMP echo;bind_ip 為 Some 時把 socket 綁定到該本地來源 IP,
+/// 讓 kernel 走對應網卡(雙網卡環境避免 ping 從錯誤介面出去)。
+fn icmp_ping(host: &str, timeout_ms: u64, bind_ip: Option<std::net::Ipv4Addr>) -> Result<bool, String> {
     let addrs: Vec<SocketAddr> = host
         .to_socket_addrs()
         .map(|it| it.filter(|a| a.is_ipv4()).collect())
@@ -282,6 +326,21 @@ fn icmp_ping(host: &str, timeout_ms: u64) -> Result<bool, String> {
             let fd = libc::socket(libc::AF_INET, ty | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP);
             if fd < 0 {
                 continue;
+            }
+            if let Some(b) = bind_ip {
+                let sa_bind = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: 0,
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(b.octets()),
+                    },
+                    sin_zero: [0u8; 8],
+                };
+                if libc::bind(fd, &sa_bind as *const _ as *const libc::sockaddr,
+                              std::mem::size_of::<libc::sockaddr_in>() as u32) < 0 {
+                    libc::close(fd);
+                    continue;
+                }
             }
             let ret = libc::sendto(
                 fd,
@@ -348,6 +407,8 @@ fn upsert_machine(body: &str, query: &str) -> Resp {
         mac: String,
         #[serde(default)]
         ip: Option<String>,
+        #[serde(default)]
+        iface: Option<String>,
     }
     let in_data: In = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -375,6 +436,7 @@ fn upsert_machine(body: &str, query: &str) -> Resp {
         name,
         mac: norm_mac(&mac).unwrap(),
         ip: in_data.ip,
+        iface: in_data.iface,
     };
     // 名稱唯一性規範化:同 name 視為 upsert
     with_state(|v| {
@@ -421,7 +483,7 @@ fn wake_machine(query: &str) -> Resp {
             if parse_mac(&m).is_none() {
                 return (400, r#"{"error":"bad mac"}"#.into());
             }
-            Some(Machine { name: m.clone(), mac: norm_mac(&m).unwrap(), ip: None })
+            Some(Machine { name: m.clone(), mac: norm_mac(&m).unwrap(), ip: None, iface: None })
         }
         _ => {
             let n = name.unwrap_or_default();
@@ -439,7 +501,7 @@ fn wake_machine(query: &str) -> Resp {
     let macb = parse_mac(&m.mac).unwrap();
     let target_ip = m.ip.as_ref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).map(|ip| ip.octets());
     let iface_q = query_param(query, "iface");
-    if let Err(e) = send_wol_opt(macb, target_ip, iface_q.as_deref()) {
+    if let Err(e) = send_wol_opt(macb, target_ip, iface_q.as_deref(), m.iface.as_deref()) {
         return (500, format!(r#"{{"error":"send failed: {:?}"}}"#, e));
     }
     (200, format!(r#"{{"ok":true,"woken":{}}}"#, serde_json::json!(m)))
@@ -459,15 +521,35 @@ fn status_machine(query: &str) -> Resp {
     if name_q.is_some() && targets.is_empty() {
         return (404, r#"{"error":"not found"}"#.into());
     }
+    let iface_q = query_param(query, "iface");
     let mut out = Vec::new();
-    for m in targets {
-        let online = match &m.ip {
-            Some(ip) => Some(icmp_ping(ip, 1000).unwrap_or(false)),
-            None => None,
-        };
-        out.push(serde_json::json!({ "name": m.name, "ip": m.ip, "online": online }));
-    }
+    // 並行 ping:每台 ≤1s,避免 N 台串聯 1s×N
+    std::thread::scope(|s| {
+        let hs: Vec<_> = targets
+            .iter()
+            .map(|m| {
+                let ip = m.ip.as_ref().and_then(|s2| s2.parse::<std::net::Ipv4Addr>().ok());
+                let force = iface_q.as_deref().or_else(|| m.iface.as_deref());
+                s.spawn(move || ping_machine(m.name.clone(), ip.map(|p| p.octets()), force))
+            })
+            .collect();
+        for h in hs {
+            out.push(h.join().unwrap());
+        }
+    });
     (200, serde_json::to_string(&out).unwrap())
+}
+
+/// 對單台機器做狀態探測(雙網卡:逐卡 fallback,
+/// 優先序 query iface > 機器設定 iface > 目標子網匹配 > 有線卡 > 其他)
+fn ping_machine(name: String, target_ip: Option<[u8; 4]>, force: Option<&str>) -> serde_json::Value {
+    match target_ip {
+        Some(oct) => {
+            let (ok, via) = ping_via_any(oct, force);
+            serde_json::json!({ "name": name, "ip": std::net::Ipv4Addr::from(oct).to_string(), "online": ok, "via": via })
+        }
+        None => serde_json::json!({ "name": name, "ip": null, "online": null, "via": null }),
+    }
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -527,13 +609,14 @@ form.add label{display:block;font-size:.85rem;color:#bbb;margin:.4rem 0 .1rem}
 .small{color:#888;font-size:.8rem;margin-top:1rem}
 </style></head><body>
 <h1>⚡ 喚醒控制台</h1>
-<p class="small">WoL 透過 broadcast 送出,狀態以 ICMP ping 判定(需填 IP)。</p>
+<p class="small">WoL 透過 broadcast 送出,狀態以 ICMP ping 判定(需填 IP)。雙網卡環境可為每部裝置或整體設定 IFACE,避免從錯誤網卡發出。</p>
 <table id="list"><thead><tr><th>Name</th><th>MAC</th><th>IP</th><th>Status</th><th></th></tr></thead>
 <tbody></tbody></table>
 <form class="add" id="addForm">
 <label>Name <input name="name" required placeholder="e.g. office-pc"></label>
 <label>MAC <input name="mac" required placeholder="aa:bb:cc:dd:ee:ff" pattern="^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$"></label>
 <label>IP (選填,用於狀態檢查) <input name="ip" placeholder="192.168.1.50"></label>
+<label>IFACE (選填,雙網卡環境指定網卡) <input name="iface" placeholder="enp6s0"></label>
 <button type="submit">新增 / 更新</button>
 </form>
 <script>
@@ -546,7 +629,7 @@ async function load(){
     const dot=st.online==null?'unk':(st.online?'on':'off');
     const tr=document.createElement('tr');
     tr.innerHTML=`<td>${m.name}</td><td><code>${m.mac}</code></td><td>${m.ip||'—'}</td>
-    <td><span class="dot ${dot}"></span>${st.online==null?'未知':(st.online?'線上':'離線')}</td>
+    <td><span class="dot ${dot}"></span>${st.online==null?'未知':(st.online?'線上':'離線')}${st.via?' <span class="small">(via '+st.via+')</span>':''}</td>
     <td><button onclick="wake('${m.name}')">喚醒</button>
     <button class="del" onclick="del('${m.name}')">刪</button></td>`;
     tbody.appendChild(tr);
@@ -565,7 +648,7 @@ async function del(name){
 document.getElementById('addForm').addEventListener('submit',async e=>{
   e.preventDefault();
   const f=new FormData(e.target);
-  const body={name:f.get('name').trim(),mac:f.get('mac').trim(),ip:f.get('ip')?f.get('ip').trim():null};
+  const body={name:f.get('name').trim(),mac:f.get('mac').trim(),ip:f.get('ip')?f.get('ip').trim():null,iface:f.get('iface')?f.get('iface').trim():null};
   const r=await fetch('/api/machines',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json(); if(!r.ok) alert('Fail: '+(j.error||r.status));
   e.target.reset(); load();
@@ -627,7 +710,7 @@ fn main() {
     if let Some(arg) = first {
         if let Some(mac) = parse_mac(arg.as_str()) {
             let r = match second.as_deref() {
-                Some(i) if !i.is_empty() => send_wol_opt(mac, None, Some(i)),
+                Some(i) if !i.is_empty() => send_wol_opt(mac, None, Some(i), None),
                 _ => send_wol(mac),
             };
             for to in r.expect("wol send") {
@@ -635,8 +718,19 @@ fn main() {
             }
             return;
         }
-        if arg.parse::<std::net::Ipv4Addr>().is_ok() {
-            let r = icmp_ping(&arg, 1000).unwrap_or(false);
+        if let Ok(ip) = arg.parse::<std::net::Ipv4Addr>() {
+            // 第二引數(選填):明確指定探測發射網卡,如 `wolrs 10.0.2.15 enp6s0`
+            // 未指定時雙網卡環境會逐卡 fallback(子網匹配 > 有線 > 其他)
+            let r = match second.as_deref().filter(|s| !s.is_empty()) {
+                Some(f) => match iface_by_name(f) {
+                    Some(i) => icmp_ping(&arg, 1000, Some(std::net::Ipv4Addr::from(i.addr))).unwrap_or(false),
+                    None => {
+                        println!("iface {} not found or not up", f);
+                        std::process::exit(2);
+                    }
+                },
+                None => ping_via_any(ip.octets(), None).0,
+            };
             println!("{}", if r { "online" } else { "offline" });
             std::process::exit(if r { 0 } else { 1 });
         }
