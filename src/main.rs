@@ -118,8 +118,9 @@ fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: u32, ifname:
 }
 
 fn octets(v: u32) -> [u8; 4] {
-    // in_addr.s_addr 的記憶體位元組序 = IP 位元組;LE 機上從 u32 讀:低 8 位 = 第一個 octet
-    v.to_be_bytes()
+    // in_addr.s_addr 在記憶體中的位元組序就是 IP 位元組序;
+    // to_ne_bytes() 回傳該 u32 的記憶體表示,LE 機上 = [o0,o1,o2,o3](第一個 octet 在低 8 位)
+    v.to_ne_bytes()
 }
 
 fn scan_ifaces() -> Vec<Iface> {
