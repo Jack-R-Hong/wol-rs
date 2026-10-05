@@ -118,7 +118,8 @@ fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: u32, ifname:
 }
 
 fn octets(v: u32) -> [u8; 4] {
-    v.to_ne_bytes()
+    // in_addr.s_addr 的記憶體位元組序 = IP 位元組;LE 機上從 u32 讀:低 8 位 = 第一個 octet
+    v.to_be_bytes()
 }
 
 fn scan_ifaces() -> Vec<Iface> {
@@ -208,17 +209,17 @@ fn ping_via_any(target_ip: [u8; 4], force: Option<&str>) -> (bool, Option<String
     let cands = pick_ifaces(Some(target_ip), force);
     for (i, c) in cands.iter().enumerate() {
         // 最優先的候選給完整超時,其餘 fallback 縮短,避免總等待過長
-        let timeout = if i == 0 { 1000 } else { 500 };
-        if icmp_ping(&p.to_string(), timeout, Some(std::net::Ipv4Addr::from(c.addr))).unwrap_or(false) {
+        let timeout: u64 = if i == 0 { 1000 } else { 500 };
+        if icmp_ping(std::net::Ipv4Addr::from(c.addr), timeout).0 {
             return (true, Some(c.name.clone()));
         }
     }
     if cands.is_empty() {
         // 沒有任何 up 的 IPv4 介面:純 kernel 選路
-        let ok = icmp_ping(&p.to_string(), 1000, None).unwrap_or(false);
+        let ok = icmp_ping(std::net::Ipv4Addr::from(p), 1000).0;
         return (ok, if ok { Some("default-route".into()) } else { None });
     }
-    if icmp_ping(&p.to_string(), 500, None).unwrap_or(false) {
+    if icmp_ping(std::net::Ipv4Addr::from(p), 500).0 {
         return (true, Some("default-route".into()));
     }
     (false, None)
@@ -285,113 +286,141 @@ fn norm_mac(s: &str) -> Option<String> {
 
 /// ICMP echo;bind_ip 為 Some 時把 socket 綁定到該本地來源 IP,
 /// 讓 kernel 走對應網卡(雙網卡環境避免 ping 從錯誤介面出去)。
-fn icmp_ping(host: &str, timeout_ms: u64, bind_ip: Option<std::net::Ipv4Addr>) -> Result<bool, String> {
-    let addrs: Vec<SocketAddr> = host
-        .to_socket_addrs()
-        .map(|it| it.filter(|a| a.is_ipv4()).collect())
-        .map_err(|e| format!("resolve failed: {}", e))?;
-    if addrs.is_empty() {
-        return Err("no IPv4 address".into());
-    }
-    let target = addrs[0];
-    let ip4: [u8; 4] = match target {
-        SocketAddr::V4(v4) => v4.ip().octets(),
-        _ => return Err("not IPv4".into()),
-    };
-    use std::hash::{Hash as _, Hasher as _};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut h);
-    let id: u16 = ((std::process::id() as u16) ^ (h.finish() as u16)) | 1;
-    let mut buf = [0u8; 16];
-    buf[0] = 0; // echo request
-    buf[1] = 0;
-    buf[2..4].copy_from_slice(&id.to_be_bytes());
-    buf[4..6].copy_from_slice(&1u16.to_be_bytes());
-    buf[8..16].copy_from_slice(b"wolrswol");
+///
+/// 封包採標準 ICMP 布局: [0]=type 8(request) [1]=code [2..4]=checksum
+/// [4..6]=id [6..8]=seq [8..]=payload。
+/// Linux SOCK_DGRAM ICMP 的三個坑:
+///   1. sendto 的 sin_port 必須等於 ICMP type(8),否則 EINVAL
+///   2. checksum 無效時 sendto 直接 EINVAL
+///   3. kernel 會用自己的 socket id 做 demux,回覆的 id 不再是我們送的值,
+///      所以 dgram 端只檢查 type==0 即可(kernel 已確保包是給我們的)
+/// SOCK_RAW 端 kernel 不攔截,檢查 type==0 && id 匹配(標準偏移 [off+4..off+6])。
+// ---------- ICMP ping(仿 iputils: dgram 不 bind、sin_port=0、poll 到 deadline) ----------
 
-    unsafe {
-        let sa = {
-            libc::sockaddr_in {
-                sin_family: libc::AF_INET as u16,
-                sin_port: 0,
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(ip4),
-                },
-                sin_zero: [0u8; 8],
-            }
+fn icmp_ping(ip: std::net::Ipv4Addr, timeout_ms: u64) -> (bool, u64) {
+    let oct = ip.octets();
+    let t0 = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(100));
+    let dbg = std::env::var_os("WOLRS_DEBUG").is_some();
+
+    // ICMP echo request, len 16: type=8 code=0, checksum, id, seq=1, "wolrswol"
+    let mut pkt: [u8; 16] = [0u8; 16];
+    pkt[0] = 8;
+    let id: u16 = std::process::id() as u16;
+    pkt[4] = (id & 0xff) as u8;
+    pkt[5] = (id >> 8) as u8;
+    pkt[6] = 1u8;  pkt[7] = 0u8;
+    pkt[8..16].copy_from_slice(b"wolrswol");
+    // one's complement checksum over whole packet
+    {
+        let mut sum: u32 = 0;
+        for w in pkt.chunks_exact(2) { sum += u16::from_be_bytes([w[0], w[1]]) as u32; }
+        while sum > 0xffff { sum = (sum >> 16) + (sum & 0xffff); }
+        let csum = (sum & 0xffff) as u16;
+        pkt[2] = (!csum & 0xff) as u8;
+        pkt[3] = (!csum >> 8) as u8;
+    }
+
+    // dest sockaddr, sin_port=0 (matches iputils; s_addr network order)
+    let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    a.sin_family = libc::AF_INET as u16;
+    a.sin_port = 0u16;
+    a.sin_addr.s_addr = (oct[0] as u32) | (oct[1] as u32) << 8 | (oct[2] as u32) << 16 | (oct[3] as u32) << 24;
+
+    let mut rb: [u8; 128] = [0u8; 128];
+
+    // ---- try 1: SOCK_DGRAM, no bind (like real ping) — kernel matches reply per-socket.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP as i32) };
+    if fd >= 0 {
+        let sn = unsafe {
+            libc::sendto(fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0,
+                &a as *const _ as *const libc::sockaddr, 16)
         };
-
-        let types = [libc::SOCK_DGRAM, libc::SOCK_RAW];
-        for &ty in types.iter() {
-            let fd = libc::socket(libc::AF_INET, ty | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP);
-            if fd < 0 {
-                continue;
-            }
-            if let Some(b) = bind_ip {
-                let sa_bind = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as u16,
-                    sin_port: 0,
-                    sin_addr: libc::in_addr {
-                        s_addr: u32::from_ne_bytes(b.octets()),
-                    },
-                    sin_zero: [0u8; 8],
-                };
-                if libc::bind(fd, &sa_bind as *const _ as *const libc::sockaddr,
-                              std::mem::size_of::<libc::sockaddr_in>() as u32) < 0 {
-                    libc::close(fd);
-                    continue;
+        if sn >= 0 {
+            if dbg { eprintln!("[dbg] dgram sent"); }
+            loop {
+                if t0.elapsed() >= timeout { break; }
+                let mut pv: [libc::pollfd; 1] = unsafe { std::mem::zeroed() };
+                pv[0].fd = fd;
+                pv[0].events = libc::POLLIN as i16;
+                let pr = unsafe { libc::poll(pv.as_mut_ptr(), 1, 250) };
+                if pr < 0 { break; }
+                if pr == 0 { continue; } // poll timeout: keep waiting until deadline
+                if (pv[0].revents & (libc::POLLIN as i16)) == 0 { break; }
+                let n = unsafe { libc::recv(fd, rb.as_mut_ptr() as *mut libc::c_void, rb.len(), 0) };
+                if n < 2 { continue; }
+                let n = n as usize;
+                let mut off = 0usize;
+                while off < n {
+                    if rb[off] == 0 {            // echo reply (dgram: kernel-managed id)
+                        let ms = t0.elapsed().as_millis() as u64;
+                        if dbg { eprintln!("[dbg] dgram reply ms={}", ms); }
+                        unsafe { libc::close(fd); }
+                        return (true, ms);
+                    }
+                    off += 1;
                 }
             }
-            let ret = libc::sendto(
-                fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-                0,
-                &sa as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as u32,
-            );
-            if ret < 0 {
-                libc::close(fd);
-                continue;
-            }
-
-            let start = std::time::Instant::now();
-            let mut ok = false;
-            while !ok && start.elapsed() < std::time::Duration::from_millis(timeout_ms) {
-                let left = timeout_ms.saturating_sub(start.elapsed().as_millis() as u64);
-                let wait = left.min(250) as i32;
-                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                if libc::poll(&mut pfd, 1, wait) <= 0 {
-                    break;
-                }
-                let mut rbuf = [0u8; 128];
-                let n = libc::recv(fd, rbuf.as_mut_ptr() as *mut libc::c_void, rbuf.len(), 0);
-                if n <= 0 {
-                    break;
-                }
-                // SOCK_RAW 會帶 IP header;SOCK_DGRAM 已被 kernel 剝掉
-                let off = if ty == libc::SOCK_RAW && n > 28 && (rbuf[0] >> 4) == 4 {
-                    ((rbuf[0] & 0x0f) as usize) * 4
-                } else {
-                    0
-                };
-                if n as usize >= off + 8 && rbuf[off] == 0 && rbuf[off + 2..off + 4] == id.to_be_bytes() {
-                    ok = true;
-                }
-            }
-            libc::close(fd);
-            if ok {
-                return Ok(true);
-            }
+        } else if dbg {
+            eprintln!("[dbg] dgram sendto: {}", std::io::Error::last_os_error());
         }
-        Ok(false)
+        unsafe { libc::close(fd); }
+    } else if dbg {
+        eprintln!("[dbg] dgram socket: {}", std::io::Error::last_os_error());
     }
+
+    // ---- try 2: SOCK_RAW (bind + id/seq match)
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP as i32) };
+    if fd >= 0 {
+        let mut any: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        any.sin_family = libc::AF_INET as u16;
+        any.sin_port = 0u16;
+        any.sin_addr.s_addr = 0u32;
+        let _ = unsafe { libc::bind(fd, &any as *const _ as *const libc::sockaddr, 16) };
+        let sn = unsafe {
+            libc::sendto(fd, pkt.as_ptr() as *const libc::c_void, pkt.len(), 0,
+                &a as *const _ as *const libc::sockaddr, 16)
+        };
+        if sn >= 0 {
+            if dbg { eprintln!("[dbg] raw sent"); }
+            loop {
+                if t0.elapsed() >= timeout { break; }
+                let mut pv: [libc::pollfd; 1] = unsafe { std::mem::zeroed() };
+                pv[0].fd = fd;
+                pv[0].events = libc::POLLIN as i16;
+                let pr = unsafe { libc::poll(pv.as_mut_ptr(), 1, 250) };
+                if pr < 0 { break; }
+                if pr == 0 { continue; }
+                if (pv[0].revents & (libc::POLLIN as i16)) == 0 { break; }
+                let n = unsafe { libc::recv(fd, rb.as_mut_ptr() as *mut libc::c_void, rb.len(), 0) };
+                if n < 8 { continue; }
+                let n = n as usize;
+                let mut off = 0usize;
+                while off + 8 <= n {
+                    if rb[off] == 0
+                        && rb[off + 4] == (id & 0xff) as u8
+                        && rb[off + 5] == (id >> 8) as u8
+                        && rb[off + 6] == 1 {
+                        let ms = t0.elapsed().as_millis() as u64;
+                        if dbg { eprintln!("[dbg] raw reply ms={}", ms); }
+                        unsafe { libc::close(fd); }
+                        return (true, ms);
+                    }
+                    off += 1;
+                }
+            }
+        } else if dbg {
+            eprintln!("[dbg] raw sendto: {}", std::io::Error::last_os_error());
+        }
+        unsafe { libc::close(fd); }
+    } else if dbg {
+        eprintln!("[dbg] raw socket: {}", std::io::Error::last_os_error());
+    }
+
+    (false, t0.elapsed().as_millis() as u64)
 }
 
-// ---------- HTTP / Web UI ----------
-
 type Resp = (u16, String);
-
 fn get_machines() -> Resp {
     let g = STATE.get_or_init(|| Mutex::new(std::vec::Vec::new())).lock().unwrap();
     (
@@ -723,7 +752,7 @@ fn main() {
             // 未指定時雙網卡環境會逐卡 fallback(子網匹配 > 有線 > 其他)
             let r = match second.as_deref().filter(|s| !s.is_empty()) {
                 Some(f) => match iface_by_name(f) {
-                    Some(i) => icmp_ping(&arg, 1000, Some(std::net::Ipv4Addr::from(i.addr))).unwrap_or(false),
+                    Some(i) => icmp_ping(std::net::Ipv4Addr::from(i.addr), 1000).0,
                     None => {
                         println!("iface {} not found or not up", f);
                         std::process::exit(2);
