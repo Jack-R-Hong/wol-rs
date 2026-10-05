@@ -1,26 +1,219 @@
-//! wol-rs: 零依賴 Wake-on-LAN 工具
-//! - CLI:  `wol <mac>`              直接在 LAN 播送 magic packet
-//! - HTTP: `wol` 啟動伺服器(預設 :8787),GET/POST /wake?mac=AA:BB:CC:DD:EE:FF
+//! wolrs — Wake-on-LAN CLI + Web 管理介面
 //!
-//! 用途:RPi3 常開 + cloudflared tunnel,異地喚醒有線 PC。
+//! 功能:
+//!   - 命名儲存機器:name / MAC / 可選 IP(JSON 持久化)
+//!   - Web UI + JSON API:新增、喚醒、刪除、ping 狀態
+//!   - CLI:`wolrs <mac>` 喚醒、`wolrs <ip>` ping
+//!
+//! 資料檔:env WOLRS_DATA,或預設 $HOME/.wolrs/machines.json
 
 use std::env;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
-use std::thread;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 
-const MAGIC_PORT: u16 = 9;
+use serde::{Deserialize, Serialize};
 
-fn send_wol(mac: [u8; 6]) -> std::io::Result<SocketAddr> {
-    // 6 個 0xFF + 重複 16 次 MAC
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct Machine {
+    name: String,
+    mac: String,
+    ip: Option<String>,
+}
+
+static STATE: OnceLock<Mutex<Vec<Machine>>> = OnceLock::new();
+
+fn data_path() -> std::path::PathBuf {
+    if let Ok(p) = env::var("WOLRS_DATA") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(home).join(".wolrs").join("machines.json")
+}
+
+fn load() -> Vec<Machine> {
+    std::fs::read_to_string(data_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn with_state<F: FnOnce(&mut Vec<Machine>)>(f: F) {
+    let s = STATE.get_or_init(|| Mutex::new(load()));
+    let mut g = s.lock().unwrap();
+    f(&mut g);
+    save(&g);
+}
+
+fn save(machines: &[Machine]) {
+    let path = data_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = {
+        let mut t = path.clone().into_os_string();
+        t.push(".tmp");
+        std::path::PathBuf::from(t)
+    };
+    let json = serde_json::to_string_pretty(machines).unwrap();
+    if std::fs::write(&tmp, &json).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+// ---------- 網卡掃描(預設優先有線) ----------
+
+struct Iface {
+    name: String,
+    addr: [u8; 4],
+    netmask: [u8; 4],
+    bcast: Option<[u8; 4]>,
+    wired: bool,
+}
+
+const SIOCGIFADDR: libc::c_ulong = 0x8915;
+const SIOCGIFBRDADDR: libc::c_ulong = 0x8919;
+const SIOCGIFNETMASK: libc::c_ulong = 0x891B;
+
+fn iface_is_up(name: &str) -> bool {
+    std::fs::read(format!("/sys/class/net/{}/operstate", name))
+        .map(|s| String::from_utf8_lossy(&s).trim() == "up")
+        .unwrap_or(false)
+}
+
+fn iface_wired(name: &str) -> bool {
+    // 有 /sys/class/net/<if>/wireless 視為無線卡
+    !std::path::Path::new(&format!("/sys/class/net/{}/wireless", name)).exists()
+}
+
+struct Ifr {
+    name: [libc::c_char; 16],
+    sa: libc::sockaddr_in,
+}
+
+fn ioctl_ifa<S: AsRef<str> + std::fmt::Debug>(fd: libc::c_int, cmd: libc::c_ulong, ifname: S) -> Option<libc::sockaddr_in> {
+    let n = S::as_ref(&ifname);
+    if n.is_empty() {
+        return None;
+    }
+    unsafe {
+        let mut ifr = std::mem::zeroed::<Ifr>();
+        let c = std::ffi::CString::new(n).ok();
+        let bytes = c.as_ref().map(|c| c.as_bytes()).unwrap_or(&[] as &[u8]);
+        let len = std::cmp::min(bytes.len(), 15);
+        ifr.name[..len].copy_from_slice(&bytes[..len].iter().map(|b| *b as libc::c_char).collect::<Vec<_>>()[..]);
+        ifr.name[len] = 0;
+        ifr.sa.sin_family = libc::AF_INET as u16;
+        let ret = libc::ioctl(fd, cmd, &ifr);
+        if ret < 0 {
+            None
+        } else {
+            Some(ifr.sa)
+        }
+    }
+}
+
+fn octets(v: u32) -> [u8; 4] {
+    v.to_ne_bytes()
+}
+
+fn scan_ifaces() -> Vec<Iface> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/net") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name == "lo" || !iface_is_up(&name) {
+                continue;
+            }
+            unsafe {
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+                if fd < 0 {
+                    continue;
+                }
+                if let Some(addr) = ioctl_ifa(fd, SIOCGIFADDR, name.clone()) {
+                    if let Some(mask) = ioctl_ifa(fd, SIOCGIFNETMASK, name.clone()) {
+                        let bcast = ioctl_ifa(fd, SIOCGIFBRDADDR, &name).map(|b| octets(b.sin_addr.s_addr));
+                        let wired = iface_wired(&name);
+                        out.push(Iface {
+                            name,
+                            addr: octets(addr.sin_addr.s_addr),
+                            netmask: octets(mask.sin_addr.s_addr),
+                            bcast,
+                            wired,
+                        });
+                    }
+                }
+                libc::close(fd);
+            }
+        }
+    }
+    out
+}
+
+fn in_net(ifc: &Iface, ip: [u8; 4]) -> bool {
+    (0..4).all(|i| (ifc.addr[i] ^ ip[i]) & ifc.netmask[i] == 0)
+}
+
+/// 依需求排序:1) 指定 iface  2) 目標 IP 所在子網  3) 有線上網卡  4) 其餘
+fn pick_ifaces(target_ip: Option<[u8; 4]>, force: Option<&str>) -> Vec<Iface> {
+    let mut ifs = scan_ifaces();
+    if let Some(f) = force.map(|s| s.to_string()) {
+        ifs.sort_by_key(|i| if i.name == f { 0 } else { 1 });
+    } else {
+        ifs.sort_by(|a, b| {
+            let ka = if target_ip.map_or(false, |ip| in_net(a, ip)) { 0 }
+                      else if a.wired { 1 } else { 2 };
+            let kb = if target_ip.map_or(false, |ip| in_net(b, ip)) { 0 }
+                      else if b.wired { 1 } else { 2 };
+            ka.cmp(&kb).then(b.name.len().cmp(&a.name.len()))
+        });
+    }
+    ifs
+}
+
+fn broadcast_of(ifc: &Iface) -> [u8; 4] {
+    if let Some(b) = ifc.bcast {
+        return b;
+    }
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        out[i] = ifc.addr[i] & ifc.netmask[i] | !ifc.netmask[i];
+    }
+    out
+}
+
+// ---------- WoL ----------
+
+/// 預設透過「有線網卡」的子網 broadcast 送出;無有線卡或目标不在此子網時,
+/// 也會順帶發給其他介面與 255.255.255.255 作保底。
+fn send_wol(mac: [u8; 6]) -> std::io::Result<Vec<SocketAddr>> { send_wol_opt(mac, None, None) }
+
+fn send_wol_opt(mac: [u8; 6], target_ip: Option<[u8; 4]>, force_iface: Option<&str>) -> std::io::Result<Vec<SocketAddr>> {
     let packet = [vec![0xFFu8; 6], mac.to_vec().repeat(16)].concat();
-
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_broadcast(true)?;
-    // 播送:LAN 內任何位置的網卡都能收到;若 PC 有固定 IP 也可改成單播
-    let to = SocketAddr::V4(SocketAddrV4::new([255, 255, 255, 255].into(), MAGIC_PORT));
-    sock.send_to(&packet, to)?;
-    Ok(to)
+    // env 覆蓋:WOLRS_IFACE=eth0
+    let force = force_iface
+        .map(|s| s.to_string())
+        .or_else(|| env::var("WOLRS_IFACE").ok())
+        .filter(|s| !s.is_empty());
+    let mut sent = Vec::new();
+    for ifc in pick_ifaces(target_ip, force.as_deref()) {
+        let bind = std::net::Ipv4Addr::from(ifc.addr);
+        let to = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(broadcast_of(&ifc))), 9u16);
+        let sock = std::net::UdpSocket::bind((bind, 0))?;
+        sock.set_broadcast(true)?;
+        sock.send_to(&packet, to)?;
+        sent.push(to);
+    }
+    // 保底:global broadcast(由 kernel 選路,雙網卡環境可能走錯卡,故放最後)
+    if !sent.is_empty() {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        sock.set_broadcast(true)?;
+        let to = SocketAddr::from(([255, 255, 255, 255], 9u16));
+        sock.send_to(&packet, to)?;
+        sent.push(to);
+    }
+    Ok(sent)
 }
 
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -30,88 +223,454 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     }
     let mut out = [0u8; 6];
     for (i, p) in parts.iter().enumerate() {
+        if p.len() != 2 {
+            return None;
+        }
         out[i] = u8::from_str_radix(p, 16).ok()?;
     }
     Some(out)
 }
 
-fn handle(client: &mut std::net::TcpStream) {
-    let mut buf = [0u8; 4096];
-    let n = client.read(&mut buf).unwrap_or(0);
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let first_line = req.lines().next().unwrap_or("");
-    let mut it = first_line.split_whitespace();
-    let method = it.next().unwrap_or("");
-    let path = it.next().unwrap_or("/");
+fn norm_mac(s: &str) -> Option<String> {
+    parse_mac(s).map(|m| m.map(|b| format!("{:02x}", b)).to_vec().join(":"))
+}
 
-    let (status, body): (&str, String) = if method == "GET" || method == "POST" {
-        // GET/POST /wake?mac=AA:BB...[:cc]
-        let mac_str = path
-            .split('?')
-            .nth(1)
-            .and_then(|q| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix("mac=").map(|s| s.to_lowercase()))
-            })
-            .unwrap_or_default();
-        match parse_mac(&mac_str) {
-            Some(mac) => match send_wol(mac) {
-                Ok(_) => ("200 OK", format!("woken: {}", mac_str)),
-                Err(e) => ("500 Internal Server Error", format!("send failed: {}", e)),
-            },
-            None => ("400 Bad Request", "usage: /wake?mac=AA:BB:CC:DD:EE:FF".into()),
+// ---------- Ping (ICMP, unprivileged via SOCK_DGRAM, fallback SOCK_RAW) ----------
+
+fn icmp_ping(host: &str, timeout_ms: u64) -> Result<bool, String> {
+    let addrs: Vec<SocketAddr> = host
+        .to_socket_addrs()
+        .map(|it| it.filter(|a| a.is_ipv4()).collect())
+        .map_err(|e| format!("resolve failed: {}", e))?;
+    if addrs.is_empty() {
+        return Err("no IPv4 address".into());
+    }
+    let target = addrs[0];
+    let ip4: [u8; 4] = match target {
+        SocketAddr::V4(v4) => v4.ip().octets(),
+        _ => return Err("not IPv4".into()),
+    };
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    let id: u16 = ((std::process::id() as u16) ^ (h.finish() as u16)) | 1;
+    let mut buf = [0u8; 16];
+    buf[0] = 0; // echo request
+    buf[1] = 0;
+    buf[2..4].copy_from_slice(&id.to_be_bytes());
+    buf[4..6].copy_from_slice(&1u16.to_be_bytes());
+    buf[8..16].copy_from_slice(b"wolrswol");
+
+    unsafe {
+        let sa = {
+            libc::sockaddr_in {
+                sin_family: libc::AF_INET as u16,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(ip4),
+                },
+                sin_zero: [0u8; 8],
+            }
+        };
+
+        let types = [libc::SOCK_DGRAM, libc::SOCK_RAW];
+        for &ty in types.iter() {
+            let fd = libc::socket(libc::AF_INET, ty | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMP);
+            if fd < 0 {
+                continue;
+            }
+            let ret = libc::sendto(
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                0,
+                &sa as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as u32,
+            );
+            if ret < 0 {
+                libc::close(fd);
+                continue;
+            }
+
+            let start = std::time::Instant::now();
+            let mut ok = false;
+            while !ok && start.elapsed() < std::time::Duration::from_millis(timeout_ms) {
+                let left = timeout_ms.saturating_sub(start.elapsed().as_millis() as u64);
+                let wait = left.min(250) as i32;
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                if libc::poll(&mut pfd, 1, wait) <= 0 {
+                    break;
+                }
+                let mut rbuf = [0u8; 128];
+                let n = libc::recv(fd, rbuf.as_mut_ptr() as *mut libc::c_void, rbuf.len(), 0);
+                if n <= 0 {
+                    break;
+                }
+                // SOCK_RAW 會帶 IP header;SOCK_DGRAM 已被 kernel 剝掉
+                let off = if ty == libc::SOCK_RAW && n > 28 && (rbuf[0] >> 4) == 4 {
+                    ((rbuf[0] & 0x0f) as usize) * 4
+                } else {
+                    0
+                };
+                if n as usize >= off + 8 && rbuf[off] == 0 && rbuf[off + 2..off + 4] == id.to_be_bytes() {
+                    ok = true;
+                }
+            }
+            libc::close(fd);
+            if ok {
+                return Ok(true);
+            }
         }
-    } else {
-        ("405 Method Not Allowed", "use GET or POST".into())
+        Ok(false)
+    }
+}
+
+// ---------- HTTP / Web UI ----------
+
+type Resp = (u16, String);
+
+fn get_machines() -> Resp {
+    let g = STATE.get_or_init(|| Mutex::new(std::vec::Vec::new())).lock().unwrap();
+    (
+        200,
+        serde_json::json!(&*g).to_string(),
+    )
+}
+
+fn upsert_machine(body: &str, query: &str) -> Resp {
+    #[derive(Deserialize)]
+    struct In {
+        name: String,
+        mac: String,
+        #[serde(default)]
+        ip: Option<String>,
+    }
+    let in_data: In = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) =>match serde_json::from_str(query) {
+            Ok(v) => v,
+            Err(_) => return (400, r#"{"error":"bad JSON, expect {\"name\",\"mac\",\"ip?\"}"}"#.into()),
+        },
     };
 
-    let resp = format!(
-        "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        status,
-        body.len(),
-        body
+    let name = in_data.name.trim().to_string();
+    let mac = in_data.mac.trim().to_lowercase();
+    if name.is_empty() {
+        return (400, r#"{"error":"name required"}"#.into());
+    }
+    if parse_mac(&mac).is_none() {
+        return (400, r#"{"error":"bad mac"}"#.into());
+    }
+    if let Some(ip) = &in_data.ip {
+        if !ip.parse::<std::net::Ipv4Addr>().is_ok() {
+            return (400, r#"{"error":"ip must be IPv4"}"#.into());
+        }
+    }
+
+    let machine = Machine {
+        name,
+        mac: norm_mac(&mac).unwrap(),
+        ip: in_data.ip,
+    };
+    // 名稱唯一性規範化:同 name 視為 upsert
+    with_state(|v| {
+        if let Some(p) = v.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&machine.name)) {
+            *p = machine.clone();
+        } else {
+            v.push(machine.clone());
+        }
+    });
+    (201, format!(r#"{{"ok":true,"machine":{}}}"#, serde_json::json!(machine)))
+}
+
+fn delete_machine(query: &str) -> Resp {
+    let name = query_param(query, "name").unwrap_or_default();
+    if name.is_empty() {
+        return (400, r#"{"error":"name required"}"#.into());
+    }
+    let removed = machine_find(&name);
+    if removed.is_none() {
+        return (404, r#"{"ok":false,"error":"not found"}"#.into());
+    }
+    with_state(|v| v.retain(|m| !m.name.eq_ignore_ascii_case(&name)));
+    (200, format!(r#"{{"ok":true,"removed":{}}}"#, serde_json::json!(&removed.unwrap())))
+}
+
+fn machine_find(name: &str) -> Option<Machine> {
+    STATE
+        .get_or_init(|| Mutex::new(std::vec::Vec::new()))
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(name))
+        .cloned()
+}
+
+fn wake_machine(query: &str) -> Resp {
+    let name = query_param(query, "name");
+    let mac_q = query_param(query, "mac");
+
+    let machine: Option<Machine> = match (&name, &mac_q) {
+        (_, Some(m)) if m.chars().count() == 17 => {
+            // 直接以 mac 喚醒
+            let m = m.to_lowercase();
+            if parse_mac(&m).is_none() {
+                return (400, r#"{"error":"bad mac"}"#.into());
+            }
+            Some(Machine { name: m.clone(), mac: norm_mac(&m).unwrap(), ip: None })
+        }
+        _ => {
+            let n = name.unwrap_or_default();
+            if n.is_empty() {
+                return (400, r#"{"error":"name or mac required"}"#.into());
+            }
+            machine_find(&n)
+        }
+    };
+
+    let m = match machine {
+        Some(m) => m,
+        None => return (404, r#"{"error":"not found"}"#.into()),
+    };
+    let macb = parse_mac(&m.mac).unwrap();
+    let target_ip = m.ip.as_ref().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).map(|ip| ip.octets());
+    let iface_q = query_param(query, "iface");
+    if let Err(e) = send_wol_opt(macb, target_ip, iface_q.as_deref()) {
+        return (500, format!(r#"{{"error":"send failed: {:?}"}}"#, e));
+    }
+    (200, format!(r#"{{"ok":true,"woken":{}}}"#, serde_json::json!(m)))
+}
+
+fn status_machine(query: &str) -> Resp {
+    let name_q = query_param(query, "name");
+    let machines = STATE
+        .get_or_init(|| Mutex::new(std::vec::Vec::new()))
+        .lock()
+        .unwrap()
+        .clone();
+    let targets: Vec<Machine> = match &name_q {
+        Some(n) => machines.into_iter().filter(|m| m.name.eq_ignore_ascii_case(n)).collect(),
+        None => machines,
+    };
+    if name_q.is_some() && targets.is_empty() {
+        return (404, r#"{"error":"not found"}"#.into());
+    }
+    let mut out = Vec::new();
+    for m in targets {
+        let online = match &m.ip {
+            Some(ip) => Some(icmp_ping(ip, 1000).unwrap_or(false)),
+            None => None,
+        };
+        out.push(serde_json::json!({ "name": m.name, "ip": m.ip, "online": online }));
+    }
+    (200, serde_json::to_string(&out).unwrap())
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query
+        .split('&')
+        .find_map(|kv| kv.split_once('=')?.0.eq(key).then(|| {
+            kv.split_once('=').map(|(_, v)| url_decode(v)).unwrap_or_default()
+        }))
+}
+
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let h = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|t| u8::from_str_radix(t, 16).ok());
+                if let Some(b) = h {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn index_html() -> &'static str {
+    r#"<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>woL-RS 控制台</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:2rem;max-width:720px;background:#111;color:#eee}
+h1{font-size:1.4rem}
+table{width:100%;border-collapse:collapse;margin-top:1rem}
+th,td{border-bottom:1px solid #333;padding:.5rem .3rem;text-align:left}
+.dot{display:inline-block;width:.9rem;height:.9rem;border-radius:50%;margin-right:.4rem;vertical-align:middle}
+.dot.on{background:#3c3}.dot.off{background:#c33}.dot.unk{background:#888}
+button{background:#265;color:#fff;border:0;padding:.35rem .7rem;border-radius:6px;cursor:pointer;font-size:.9rem}
+button.del{background:#633}
+input{background:#222;color:#eee;border:1px solid #444;padding:.4rem;border-radius:6px;margin:.15rem 0}
+form.add{background:#1a1a1a;padding:1rem;border-radius:10px;margin-top:1.2rem}
+form.add label{display:block;font-size:.85rem;color:#bbb;margin:.4rem 0 .1rem}
+.small{color:#888;font-size:.8rem;margin-top:1rem}
+</style></head><body>
+<h1>⚡ 喚醒控制台</h1>
+<p class="small">WoL 透過 broadcast 送出,狀態以 ICMP ping 判定(需填 IP)。</p>
+<table id="list"><thead><tr><th>Name</th><th>MAC</th><th>IP</th><th>Status</th><th></th></tr></thead>
+<tbody></tbody></table>
+<form class="add" id="addForm">
+<label>Name <input name="name" required placeholder="e.g. office-pc"></label>
+<label>MAC <input name="mac" required placeholder="aa:bb:cc:dd:ee:ff" pattern="^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$"></label>
+<label>IP (選填,用於狀態檢查) <input name="ip" placeholder="192.168.1.50"></label>
+<button type="submit">新增 / 更新</button>
+</form>
+<script>
+async function load(){
+  const r=await fetch('/api/machines');const ms=await r.json();
+  let sr=null; try{ sr=await (await fetch('/api/status')).json(); }catch(e){}
+  const tbody=document.querySelector('#list tbody');tbody.innerHTML='';
+  for(const m of ms){
+    const st=(sr&&sr.find(s=>s.name===m.name))||{};
+    const dot=st.online==null?'unk':(st.online?'on':'off');
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${m.name}</td><td><code>${m.mac}</code></td><td>${m.ip||'—'}</td>
+    <td><span class="dot ${dot}"></span>${st.online==null?'未知':(st.online?'線上':'離線')}</td>
+    <td><button onclick="wake('${m.name}')">喚醒</button>
+    <button class="del" onclick="del('${m.name}')">刪</button></td>`;
+    tbody.appendChild(tr);
+  }
+  if(!ms.length) tbody.innerHTML='<tr><td colspan="5" style="color:#666">尚無機器,請下方新增</td></tr>';
+}
+async function wake(name){
+  const r=await fetch('/api/wake?name='+encodeURIComponent(name),{method:'POST'});
+  const j=await r.json(); if(!r.ok) alert('Fail: '+(j.error||r.status)); else alert('已傳送喚醒 '+name);
+}
+async function del(name){
+  if(!confirm('刪除 '+name+' ?')) return;
+  await fetch('/api/machines?name='+encodeURIComponent(name),{method:'DELETE'});
+  load();
+}
+document.getElementById('addForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const f=new FormData(e.target);
+  const body={name:f.get('name').trim(),mac:f.get('mac').trim(),ip:f.get('ip')?f.get('ip').trim():null};
+  const r=await fetch('/api/machines',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json(); if(!r.ok) alert('Fail: '+(j.error||r.status));
+  e.target.reset(); load();
+});
+load(); setInterval(load,5000);
+</script></body></html>"#
+}
+
+fn handle(client: &mut std::net::TcpStream) {
+    let mut buf = [0u8; 16384];
+    let n = client.read(&mut buf).unwrap_or(0);
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let mut lines = req.split("\r\n\r\n");
+    let head = lines.next().unwrap_or("");
+    let first_line = head.lines().next().unwrap_or("");
+    let mut it = first_line.split_whitespace();
+    let method = it.next().unwrap_or("");
+    let target = it.next().unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let body = lines.next().unwrap_or("").trim();
+
+    let resp = match (method, path) {
+        ("GET", "/") | ("GET", "/index.html") => (200, index_html().to_string()),
+        ("GET", "/api/machines") => get_machines(),
+        ("GET", "/api/status") => status_machine(query),
+        ("GET", "/api/wake") => wake_machine(query),
+        ("POST", "/api/machines") => upsert_machine(body, query),
+        ("POST", "/api/wake") => wake_machine(query),
+        ("DELETE", "/api/machines") => delete_machine(query),
+        ("GET", "/healthz") => (200, "ok".into()),
+        _ => (404, "not found".into()),
+    };
+
+    let (status, body) = resp;
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    let is_html = body.starts_with("<!doctype");
+    let ctype = if is_html { "text/html; charset=utf-8" } else { "application/json" };
+    let r = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+        status, reason, ctype, body.len(), body
     );
-    let _ = client.write_all(resp.as_bytes());
+    let _ = client.write_all(r.as_bytes());
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
-    let first = args.next();
+    let mut args_iter = env::args().skip(1);
+    let first = args_iter.next();
+    let second = args_iter.next(); // 可選:指定發射網卡,如 eth0
 
-    // CLI 模式: wol aa:bb:cc:dd:ee:ff  →  直接播送一次
-    if let Some(mac) = first.and_then(|m| parse_mac(m.as_str())) {
-        send_wol(mac).expect("wol send");
-        return;
+    // CLI 模式
+    if let Some(arg) = first {
+        if let Some(mac) = parse_mac(arg.as_str()) {
+            let r = match second.as_deref() {
+                Some(i) if !i.is_empty() => send_wol_opt(mac, None, Some(i)),
+                _ => send_wol(mac),
+            };
+            for to in r.expect("wol send") {
+                println!("-> {}", to);
+            }
+            return;
+        }
+        if arg.parse::<std::net::Ipv4Addr>().is_ok() {
+            let r = icmp_ping(&arg, 1000).unwrap_or(false);
+            println!("{}", if r { "online" } else { "offline" });
+            std::process::exit(if r { 0 } else { 1 });
+        }
     }
 
-    // 伺服器模式,預設 port 8787,可用 PORT env 改
+    // 初始化並載入
+    with_state(|_v| {});
+
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8787);
     let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("bind 0.0.0.0:port");
-    println!("wol server on 0.0.0.0:{}", port);
+    println!("wolrs web+api on 0.0.0.0:{}  data={}", port, data_path().display());
     for stream in listener.incoming() {
         if let Ok(mut s) = stream {
-            thread::spawn(move || handle(&mut s));
+            std::thread::spawn(move || handle(&mut s));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mac;
-
+    use super::*;
     #[test]
     fn valid_mac() {
-        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
-        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        let m = parse_mac("00:11:22:33:44:55").unwrap();
+        assert_eq!(m, [0, 17, 34, 51, 68, 85]);
+        assert_eq!(norm_mac("AB:CD:EF:01:23:45").unwrap(), "ab:cd:ef:01:23:45");
     }
-
     #[test]
     fn invalid_mac() {
-        assert_eq!(parse_mac("aabbccddeeff"), None);
-        assert_eq!(parse_mac("aa:bb:cc:dd:ee"), None);
-        assert_eq!(parse_mac("zz:bb:cc:dd:ee:ff"), None);
+        assert!(parse_mac("1:2:3:4:5:6").is_none());
+        assert!(parse_mac("AA:BB:CC:DD:EE").is_none());
+        assert!(parse_mac("").is_none());
+    }
+    #[test]
+    fn bad_mac_rejected() {
+        assert!(parse_mac("GG:BB:CC:DD:EE:FF").is_none());
     }
 }

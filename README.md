@@ -8,15 +8,22 @@
 ## 原理
 
 RPi3 常開 → Cloudflare Tunnel 把它的 HTTP 服務暴露到 `https://wol.example.com`
-→ 手機/別台機器呼叫 API → RPi3 往 255.255.255.255:9 播送 magic packet
+→ 手機/別台機器呼叫 API → RPi3 以「有線網卡」的子網 broadcast(如 x.x.255.255:9)送出 magic packet
 → 交換器中繼 broadcast → PC 網卡收到、BIOS WoL 啟用 → 開機。
+
+**雙網卡(wlan + lan)注意事項**:broadcast 會依 routing 選發射卡,容易走錯卡。
+本程式會掃描 `/sys/class/net`,**預設優先有線卡**,並 bind 該卡 IP 向該子網 broadcast 發送;
+之後仍會順帶發給其他介面與 255.255.255.255 作保底。
+若機器有填 IP,則該 IP 所在子網的介面自動置頂。
 
 ## 使用
 
 ### CLI(LAN 內直接喚醒)
 
 ```sh
-wolrs aa:bb:cc:dd:ee:ff
+wolrs aa:bb:cc:dd:ee:ff            # 預設:有線卡優先
+wolrs aa:bb:cc:dd:ee:ff eth0       # 指定發射網卡
+WOLRS_IFACE=enp6s0 wolrs aa:bb:cc:dd:ee:ff   # 或用環境變數全域指定
 ```
 
 ### HTTP server
@@ -24,6 +31,8 @@ wolrs aa:bb:cc:dd:ee:ff
 ```sh
 PORT=8787 ./wolrs        # 預設即 8787
 curl "http://127.0.0.1:8787/wake?mac=aa:bb:cc:dd:ee:ff"
+# 指定發射網卡:
+curl "http://127.0.0.1:8787/api/wake?name=pc1&iface=enp6s0"
 # => 200 OK  "woken: aa:bb:cc:dd:ee:ff"
 ```
 
